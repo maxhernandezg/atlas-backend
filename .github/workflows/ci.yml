@@ -1,0 +1,64 @@
+name: CI Backend
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Instalar, validar y construir imagen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Instalar dependencias (lockfile)
+        run: npm ci
+
+      - name: Validar sintaxis de los modulos
+        run: find src -name '*.js' -print0 | xargs -0 -n1 node --check
+
+      - name: Auditoria de dependencias (SCA)
+        # Informativo: el resultado se registra pero no bloquea, se gestiona en el plan de mitigacion.
+        continue-on-error: true
+        run: npm audit --audit-level=high
+
+      - name: Construir imagen Docker
+        run: docker build -t atlas-backend:ci .
+
+  smoke:
+    name: Smoke test API + PostgreSQL
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Levantar API y base de datos
+        env:
+          JWT_SECRET: ci-${{ github.run_id }}
+        run: docker compose up -d --build --wait --wait-timeout 180 atlas-postgres && docker compose up -d --build atlas-backend
+
+      - name: Esperar API y validar login
+        run: |
+          for i in $(seq 1 30); do curl -sf http://localhost:4450/ && break; sleep 2; done
+          curl -sf http://localhost:4450/ | grep -q '"status":"ok"'
+          curl -sf -X POST http://localhost:4450/autenticacion/login \
+            -H 'Content-Type: application/json' \
+            -d '{"nombre_usuario":"admin","password":"admin"}' | grep -q token
+
+      - name: Logs ante fallo
+        if: failure()
+        run: docker compose logs
+
+      - name: Bajar servicios
+        if: always()
+        run: docker compose down -v
